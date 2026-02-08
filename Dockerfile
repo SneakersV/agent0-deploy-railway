@@ -1,20 +1,21 @@
-# Kế thừa từ Image gốc
 FROM agent0ai/agent-zero:latest
 
-# Thiết lập thư mục làm việc
 WORKDIR /a0
 
-# --- SỬA LỖI Ở ĐÂY ---
-# Thay vì gọi "pip", hãy gọi "/opt/venv-a0/bin/pip"
-# Cài đặt thư viện vào đúng môi trường ảo của Agent0
-RUN /opt/venv-a0/bin/pip install "numpy<2.0.0" fastapi uvicorn pydantic
+# Pin các gói để tránh lỗi SciPy/NumPy
+RUN /opt/venv-a0/bin/pip install --no-cache-dir -U \
+  "pip<25" "setuptools" "wheel" \
+  "numpy<2" \
+  "scipy>=1.11,<1.13" \
+  "scikit-learn>=1.4,<1.6" \
+  "transformers<4.50" \
+  "sentence-transformers<3.0" \
+  fastapi uvicorn pydantic
 
-# Copy file main.py (API Wrapper) của bạn vào
 COPY main.py /a0/main.py
 
-# Mở cổng 8000
+# Railway sẽ set PORT, nên expose không quan trọng lắm, nhưng để rõ:
 EXPOSE 8000
 
-# --- SỬA LỖI KHỞI ĐỘNG ---
-# Dùng python trong môi trường ảo để chạy server
-CMD ["/opt/venv-a0/bin/python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Listen đúng PORT của Railway
+CMD ["/bin/sh","-lc","/opt/venv-a0/bin/python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-80}"]
