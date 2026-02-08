@@ -7,48 +7,60 @@ from typing import Any, Dict, List, Optional
 
 app = FastAPI()
 
-# ===== ENV =====
+# ========= ENV =========
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-pro").strip()
 
-# Base URL nội bộ của n8n (private network)
-# Ví dụ: http://primary.railway.internal:5678
-N8N_TOOL_BASE_URL = os.getenv("N8N_TOOL_BASE_URL", "").rstrip("/")
+# Private network base URL của n8n
+# vd: http://primary.railway.internal:5678
+N8N_TOOL_BASE_URL = os.getenv("N8N_TOOL_BASE_URL", "").strip().rstrip("/")
 
-# Vì bạn dùng private network, có thể để trống (không auth).
-# Nếu bạn muốn bảo mật thêm, set N8N_TOOL_KEY và n8n kiểm tra header X-TOOL-KEY.
+# Optional header key (bạn có thể bỏ trống nếu chỉ dùng private network)
 N8N_TOOL_KEY = os.getenv("N8N_TOOL_KEY", "").strip()
 
-# Tool paths (để bạn đổi dễ dàng mà không sửa code)
-TOOL_SEARCH_PATH = os.getenv("TOOL_SEARCH_PATH", "/webhook/tool_search_docs")
-TOOL_GET_TEXT_PATH = os.getenv("TOOL_GET_TEXT_PATH", "/webhook/tool_get_doc_text")
+TOOL_SEARCH_PATH = os.getenv("TOOL_SEARCH_PATH", "/webhook/tool_search_docs").strip()
+TOOL_GET_TEXT_PATH = os.getenv("TOOL_GET_TEXT_PATH", "/webhook/tool_get_doc_text").strip()
 
-# Gemini model
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
+# Limits để tránh prompt quá dài
+MAX_HISTORY_CHARS = int(os.getenv("MAX_HISTORY_CHARS", "8000"))
+MAX_ATTACH_CHARS = int(os.getenv("MAX_ATTACH_CHARS", "8000"))
+MAX_TOOL_CHARS = int(os.getenv("MAX_TOOL_CHARS", "12000"))
 
-# ===== Schemas =====
+# ========= Schemas =========
 class ChatReq(BaseModel):
     message: str = Field(..., description="User message")
-    chat_history: Optional[List[Dict[str, Any]]] = Field(default=None, description="Last turns, optional")
-    attachments_context: Optional[Dict[str, Any]] = Field(default=None, description="Extracted context from pdf/excel/image, optional")
-    max_steps: int = Field(default=3, ge=1, le=6, description="Max agent steps (tool loops)")
+    chat_history: Optional[List[Dict[str, Any]]] = Field(default=None, description="Recent chat turns")
+    attachments_context: Optional[Dict[str, Any]] = Field(default=None, description="Preprocessed text from pdf/excel/image")
+    max_steps: int = Field(default=3, ge=1, le=6, description="Max agent iterations")
+
 
 class ChatResp(BaseModel):
     answer: str
     steps: List[Dict[str, Any]]
 
 
-# ===== Helpers =====
-def gemini_generate(text: str, temperature: float = 0.2, max_output_tokens: int = 2048) -> str:
+# ========= Helpers =========
+def _truncate_json(obj: Any, limit: int) -> str:
+    """Dump JSON rồi cắt chuỗi để tránh quá dài."""
+    try:
+        s = json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        s = str(obj)
+    return s[:limit]
+
+
+def gemini_generate(prompt: str, temperature: float = 0.2, max_output_tokens: int = 2048) -> str:
+    """Call Gemini API generateContent."""
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=500, detail="Missing GEMINI_API_KEY in Railway variables")
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     payload = {
-        "contents": [{"parts": [{"text": text}]}],
+        "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": temperature,
             "maxOutputTokens": max_output_tokens,
-        }
+        },
     }
     r = requests.post(url, json=payload, timeout=90)
     if r.status_code != 200:
@@ -58,11 +70,30 @@ def gemini_generate(text: str, temperature: float = 0.2, max_output_tokens: int 
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"]
     except Exception:
-        # fallback: return raw json for debugging
+        # fallback: trả raw json để debug
         return json.dumps(data, ensure_ascii=False)
 
 
-def call_n8n_tool(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+def safe_parse_json(txt: str) -> Dict[str, Any]:
+    """
+    Gemini đôi khi trả thêm text ngoài JSON. Cố tìm đoạn {...} để parse.
+    Nếu không parse được -> trả action final.
+    """
+    t = (txt or "").strip()
+    start = t.find("{")
+    end = t.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return {"action": "final", "answer": t, "reason": "Planner did not return JSON"}
+
+    chunk = t[start:end + 1]
+    try:
+        return json.loads(chunk)
+    except Exception:
+        return {"action": "final", "answer": t, "reason": "Failed to parse planner JSON"}
+
+
+def call_n8n(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """Call n8n tool webhook via private network."""
     if not N8N_TOOL_BASE_URL:
         raise HTTPException(status_code=500, detail="Missing N8N_TOOL_BASE_URL in Railway variables")
 
@@ -74,34 +105,24 @@ def call_n8n_tool(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
     r = requests.post(url, json=body, headers=headers, timeout=180)
     if r.status_code != 200:
         raise HTTPException(status_code=r.status_code, detail=r.text)
-    return r.json()
-
-
-def safe_json_from_text(txt: str) -> Dict[str, Any]:
-    """
-    Gemini đôi khi trả thêm text ngoài JSON.
-    Hàm này cố cắt đoạn {...} để parse JSON.
-    """
-    txt = txt.strip()
-    start = txt.find("{")
-    end = txt.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return {"action": "final", "answer": txt}
-
     try:
-        return json.loads(txt[start:end+1])
+        return r.json()
     except Exception:
-        return {"action": "final", "answer": txt}
+        return {"raw": r.text}
 
 
-# ===== API =====
+# ========= API =========
 @app.get("/")
 def health():
     return {
         "status": "ok",
-        "service": "agent0-wrapper",
+        "service": "agent0-agentic-wrapper",
         "model": GEMINI_MODEL,
-        "n8n_base": N8N_TOOL_BASE_URL or None
+        "n8n_base": N8N_TOOL_BASE_URL or None,
+        "tools": {
+            "search_path": TOOL_SEARCH_PATH,
+            "get_text_path": TOOL_GET_TEXT_PATH,
+        },
     }
 
 
@@ -109,80 +130,146 @@ def health():
 def chat(req: ChatReq):
     steps: List[Dict[str, Any]] = []
 
-    # Context packing (giới hạn để tránh prompt quá dài)
+    user_msg = (req.message or "").strip()
+    if not user_msg:
+        raise HTTPException(status_code=400, detail="message is required")
+
     history = req.chat_history or []
     attach = req.attachments_context or {}
 
-    # Agent loop: plan -> (tool?) -> observe -> answer
-    tool_observation: Optional[Dict[str, Any]] = None
+    history_txt = _truncate_json(history, MAX_HISTORY_CHARS)
+    attach_txt = _truncate_json(attach, MAX_ATTACH_CHARS)
+
+    tool_observation: Dict[str, Any] = {}  # luôn là dict
+    final_answer: Optional[str] = None
 
     for i in range(req.max_steps):
+        tool_obs_txt = _truncate_json(tool_observation, MAX_TOOL_CHARS)
+
         planner_prompt = f"""
-You are an agent. Decide the next action.
+You are an agent. Decide the NEXT action. Return ONLY JSON (no markdown, no extra text).
 
-You have tools:
-1) search_docs: retrieve relevant snippets from user's documents.
-   args: {{"query": "...", "top_k": 5}}
-2) get_doc_text: fetch detailed text for a specific document.
-   args: {{"drive_file_id": "..."}}  (or another id your n8n expects)
+Available tools:
+1) search_docs: Use to retrieve relevant snippets from user's document store.
+   args: {{"query":"...","top_k":5}}
 
-Return ONLY JSON in one of forms:
-- {{"action":"search_docs","args":{{...}},"reason":"..."}}
-- {{"action":"get_doc_text","args":{{...}},"reason":"..."}}
-- {{"action":"final","answer":"...","reason":"..."}}
+2) get_doc_text: Use to fetch detailed extracted text for a specific document.
+   args: {{"drive_file_id":"..."}}
 
-User message: {req.message}
+If no tool is needed:
+{{"action":"final","answer":"...","reason":"..."}}
 
-Chat history (recent): {json.dumps(history, ensure_ascii=False)[:6000]}
-Attachments context: {json.dumps(attach, ensure_ascii=False)[:6000]}
-Tool observation so far: {json.dumps(tool_observation or {{}}, ensure_ascii=False)[:6000]}
-"""
+Rules:
+- Prefer search_docs first, then get_doc_text if you need deeper details.
+- Keep args minimal.
+- Do not hallucinate document IDs; only request get_doc_text if you have an ID from tool results or attachments context.
+
+User message:
+{user_msg}
+
+Chat history (recent, JSON):
+{history_txt}
+
+Attachments context (JSON):
+{attach_txt}
+
+Tool observation so far (JSON):
+{tool_obs_txt}
+""".strip()
+
         raw = gemini_generate(planner_prompt, temperature=0.0, max_output_tokens=1024)
-        action = safe_json_from_text(raw)
+        action = safe_parse_json(raw)
 
-        steps.append({"step": i+1, "planner_raw": raw, "action": action})
+        steps.append({
+            "step": i + 1,
+            "planner_raw": raw,
+            "action": action
+        })
 
-        if action.get("action") == "final":
-            answer = action.get("answer") or raw
-            return {"answer": answer, "steps": steps}
+        act = (action.get("action") or "").strip()
 
-        if action.get("action") == "search_docs":
+        # ---- final ----
+        if act == "final":
+            final_answer = (action.get("answer") or "").strip() or raw.strip()
+            break
+
+        # ---- search_docs ----
+        if act == "search_docs":
             args = action.get("args") or {}
-            # default top_k
+            if not isinstance(args, dict):
+                args = {}
+            args.setdefault("query", user_msg)
             args.setdefault("top_k", 5)
-            obs = call_n8n_tool(TOOL_SEARCH_PATH, args)
-            tool_observation = {"tool": "search_docs", "args": args, "result": obs}
-            steps.append({"step": i+1, "tool_call": tool_observation})
+
+            obs = call_n8n(TOOL_SEARCH_PATH, args)
+            tool_observation = {
+                "last_tool": "search_docs",
+                "args": args,
+                "result": obs,
+            }
+            steps.append({"step": i + 1, "tool_observation": tool_observation})
             continue
 
-        if action.get("action") == "get_doc_text":
+        # ---- get_doc_text ----
+        if act == "get_doc_text":
             args = action.get("args") or {}
-            obs = call_n8n_tool(TOOL_GET_TEXT_PATH, args)
-            tool_observation = {"tool": "get_doc_text", "args": args, "result": obs}
-            steps.append({"step": i+1, "tool_call": tool_observation})
+            if not isinstance(args, dict):
+                args = {}
+
+            if not args.get("drive_file_id"):
+                # Nếu planner đòi get_doc_text mà không có id -> buộc search trước
+                obs = call_n8n(TOOL_SEARCH_PATH, {"query": user_msg, "top_k": 5})
+                tool_observation = {
+                    "last_tool": "search_docs_for_missing_id",
+                    "args": {"query": user_msg, "top_k": 5},
+                    "result": obs,
+                }
+                steps.append({"step": i + 1, "tool_observation": tool_observation})
+                continue
+
+            obs = call_n8n(TOOL_GET_TEXT_PATH, args)
+            tool_observation = {
+                "last_tool": "get_doc_text",
+                "args": args,
+                "result": obs,
+            }
+            steps.append({"step": i + 1, "tool_observation": tool_observation})
             continue
 
-        # Unknown action -> fallback to final answer
+        # ---- unknown action fallback: answer directly ----
+        tool_obs_txt = _truncate_json(tool_observation, MAX_TOOL_CHARS)
         final_prompt = f"""
-Answer the user. If missing info, ask a concise clarifying question.
+Answer the user as best as possible using provided context.
+If info is missing, ask 1-2 concise clarifying questions.
 
-User: {req.message}
-Chat history: {json.dumps(history, ensure_ascii=False)[:6000]}
-Attachments: {json.dumps(attach, ensure_ascii=False)[:6000]}
-Tool observation: {json.dumps(tool_observation or {{}}, ensure_ascii=False)[:6000]}
-"""
-        answer = gemini_generate(final_prompt, temperature=0.2, max_output_tokens=2048)
-        steps.append({"step": i+1, "fallback_answer": answer})
-        return {"answer": answer, "steps": steps}
+User: {user_msg}
 
-    # If loop ends without final, produce answer using whatever we have
-    final_prompt = f"""
-Provide the best possible answer using available context and tool results.
+Chat history: {history_txt}
 
-User: {req.message}
-Attachments: {json.dumps(attach, ensure_ascii=False)[:6000]}
-Tool observation: {json.dumps(tool_observation or {{}}, ensure_ascii=False)[:8000]}
-"""
-    answer = gemini_generate(final_prompt, temperature=0.2, max_output_tokens=2048)
-    steps.append({"final_fallback": True, "answer": answer})
-    return {"answer": answer, "steps": steps}
+Attachments context: {attach_txt}
+
+Tool observation: {tool_obs_txt}
+""".strip()
+
+        final_answer = gemini_generate(final_prompt, temperature=0.2, max_output_tokens=2048).strip()
+        steps.append({"step": i + 1, "fallback": True})
+        break
+
+    # If still no final answer, do a final synthesis
+    if not final_answer:
+        tool_obs_txt = _truncate_json(tool_observation, MAX_TOOL_CHARS)
+        final_prompt = f"""
+Provide the best possible answer using all context and tool results.
+
+User: {user_msg}
+
+Chat history: {history_txt}
+
+Attachments context: {attach_txt}
+
+Tool observation: {tool_obs_txt}
+""".strip()
+        final_answer = gemini_generate(final_prompt, temperature=0.2, max_output_tokens=2048).strip()
+        steps.append({"final_synthesis": True})
+
+    return {"answer": final_answer, "steps": steps}
