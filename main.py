@@ -9,7 +9,7 @@ app = FastAPI()
 
 # ========= ENV =========
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-pro").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
 # Private network base URL của n8n
 # vd: http://primary.railway.internal:5678
